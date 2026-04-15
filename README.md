@@ -27,7 +27,7 @@ It calculates rolling averages from your real data and adds a tiny growth factor
 | **Est Price**                     | `avg_price × (1 + (target - current) × 0.00005)`                                              | All stored blocks          | 3                     |
 | **HR/Price**                      | `estimated_hashrate ÷ estimated_price`                                                         | From above two fields      | 3                     |
 | **Est Tx**                        | `avg_tx_count × 1.02`                                                                          | All stored blocks          | 3                     |
-| **Est Nonce**                     | Fixed placeholder (real nonce is random per block)                                             | —                          | —                     |
+| **Est Nonce**                     | random value between estimated min/max range                                             | —                          | —                     |
 | **Potential Winning Nonce**       | `estimated_nonce + 1337`                                                                       | —                          | —                     |
 
 **Recent Rate** (button):
