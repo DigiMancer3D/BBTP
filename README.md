@@ -156,12 +156,7 @@ Stores window size, unfinished work, API flags & cooldowns, prediction adjusters
 
 ---
 
-**Project maintained by DigiMancer3D**  
-Latest updates always available at: https://github.com/DigiMancer3D/BBTP
-
 Enjoy predicting the Bitcoin blockchain! 🚀
-```
 
-This README now fully reflects the current state of the program (no tray icon, clean window icon loading, all the latest features like BTD, self-correcting trends, etc.).
+---
 
-You can copy the entire block above and paste it directly into your GitHub repo’s `README.md` file. Let me know if you want any section expanded, shortened, or additional screenshots/tables added!
