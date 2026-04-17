@@ -11,6 +11,8 @@ from typing import Dict, Optional, List
 import random
 from threading import RLock
 import sys
+import textwrap
+import re
 
 CACHE_FILE = "BBTP.crumbs"
 BTC_CHAIN_FILE = "BTC.chain"
@@ -231,9 +233,14 @@ class DataEnricher:
 class BTCBlockPredictorGUI(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("🟠 BTC Block Time Predictor")
+        self.title("🟠 BTC Block Time Predictor [BBTP]")
         self.geometry("1420x980")
+        self.minsize(900, 650)
         self.resizable(True, True)
+
+        # === LOAD bbtp-icon.png FOR WINDOW / TASK MANAGER ===
+        self.set_window_icon()
+
         self.update_queue = queue.Queue()
         self.cache: Dict[str, dict] = {}
         self.chain: Dict[str, dict] = {}
@@ -271,6 +278,7 @@ class BTCBlockPredictorGUI(tk.Tk):
         self.window_width = 1420
         self.window_height = 980
         self.unfinished_work = []
+        self.debug_active = False
 
         self.data_settings = {
             "timestamp": True, "hash": True, "size": True, "tx_count": True,
@@ -315,17 +323,208 @@ class BTCBlockPredictorGUI(tk.Tk):
         self.create_widgets()
         self._build_dynamic_welcome()
         self.update_status()
+        self.after(500, self.pre_fill_all_notebooks)
         self.after(1000, self.periodic_new_block_checker)
         self.after(60000, self.periodic_notebook_refresh)
         self.after(300, self.live_timer)
+
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+    def set_window_icon(self):
+        """Load bbtp-icon.png for window / task manager"""
+        icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bbtp-icon.png")
+        try:
+            if os.path.exists(icon_path):
+                photo = tk.PhotoImage(file=icon_path)
+                self.iconphoto(True, photo)
+                self._icon_image = photo
+                print("✅ Loaded bbtp-icon.png for window / task manager")
+                return
+            else:
+                print("⚠️ bbtp-icon.png not found next to BBTP.py")
+        except Exception as e:
+            print(f"⚠️ Window icon load failed: {e}")
+        print("⚠️ Using no icon for window (PNG missing)")
+
+    # === ALL OTHER METHODS (unchanged) ===
+    def advanced_math_wrap(self, text, width=48):
+        if not text or len(str(text)) <= width:
+            return str(text)
+        text = re.sub(r'([=+*/(),;:\[\]{}])', r' \1 ', str(text))
+        text = re.sub(r'\s+', ' ', text).strip()
+        wrapped = textwrap.fill(text, width=width, break_long_words=False, break_on_hyphens=True, replace_whitespace=True)
+        return wrapped
+
+    def scroll_notebook_y(self, *args):
+        if hasattr(self, "tree"):
+            self.tree.yview(*args)
+
+    def set_notebook_scroll(self, first, last):
+        if hasattr(self, "hsb_notebook"):
+            self.hsb_notebook.set(first, last)
+
+    def scroll_predicts_y(self, *args):
+        if hasattr(self, "predict_tree"):
+            self.predict_tree.yview(*args)
+
+    def set_predicts_scroll(self, first, last):
+        if hasattr(self, "hsb_predicts"):
+            self.hsb_predicts.set(first, last)
+
+    def scroll_livep_y(self, *args):
+        if hasattr(self, "livep_tree"):
+            self.livep_tree.yview(*args)
+
+    def set_livep_scroll(self, first, last):
+        if hasattr(self, "hsb_livep"):
+            self.hsb_livep.set(first, last)
+
+    def scroll_maths_y(self, *args):
+        if hasattr(self, "maths_tree"):
+            self.maths_tree.yview(*args)
+
+    def set_maths_scroll(self, first, last):
+        if hasattr(self, "hsb_maths"):
+            self.hsb_maths.set(first, last)
+
+    def refresh_notebook_view(self):
+        if not hasattr(self, "tree"):
+            return
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        try:
+            with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if "__settings__" in data:
+                data.pop("__settings__")
+        except:
+            return
+        heights = sorted(int(h) for h in data.keys())
+        try:
+            fmin = int(self.filter_min.get() or 0)
+            fmax = int(self.filter_max.get() or 999999999)
+            heights = [h for h in heights if fmin <= h <= fmax]
+        except:
+            pass
+        term = self.search_var.get().strip().lower()
+        if term:
+            heights = [h for h in heights if term in str(h) or term in str(data[str(h)].get("hash", "")).lower()]
+        total_pages = (len(heights) + self.page_size - 1) // self.page_size
+        start = self.current_page * self.page_size
+        page_heights = heights[start:start + self.page_size]
+        for h in page_heights:
+            b = data[str(h)]
+            hash_str = str(b.get("hash", ""))
+            stripped = hash_str.lstrip("0")
+            leading_zeros = len(hash_str) - len(stripped) if hash_str else 0
+            display_hash = f"{stripped[:6]}...{stripped[-6:]}" if len(stripped) > 12 else stripped or "—"
+            self.tree.insert("", "end", values=(
+                h, b.get("time", 0), leading_zeros, display_hash,
+                b.get("size", ""), b.get("tx_count", ""), b.get("nonce", ""),
+                f"{b.get('difficulty', 0):.2f}" if b.get("difficulty") else "",
+                f"{b.get('estimated_hashrate', 0):.4f}" if b.get("estimated_hashrate") else "",
+                f"${b.get('price_usd', 0):,.2f}" if b.get("price_usd") else ""
+            ))
+        self.page_label.config(text=f"Page {self.current_page + 1} / {max(1, total_pages)}")
+
+    def clear_notebook_filters(self):
+        self.filter_min.delete(0, tk.END)
+        self.filter_max.delete(0, tk.END)
+        self.search_var.set("")
+        self.current_page = 0
+        self.refresh_notebook_view()
+
+    def refresh_predicts_view(self):
+        if not hasattr(self, "predict_tree"):
+            return
+        for item in self.predict_tree.get_children():
+            self.predict_tree.delete(item)
+        term = self.predict_search_var.get().strip().lower()
+        filtered = self.predicts
+        if term:
+            filtered = [p for p in self.predicts if term in str(p.get("target", "")) or term in str(p.get("est_time_str", ""))]
+        total_pages = (len(filtered) + self.predict_page_size - 1) // self.predict_page_size
+        start = self.predict_current_page * self.predict_page_size
+        page_data = filtered[start:start + self.predict_page_size]
+        for p in page_data:
+            self.predict_tree.insert("", "end", values=(
+                p.get("target", ""),
+                p.get("est_time_str", ""),
+                f"{p.get('delta_days', 0):+.2f}",
+                p.get("est_hr", ""),
+                p.get("est_price", ""),
+                p.get("est_tx", ""),
+                p.get("timestamp_str", "")
+            ))
+        self.predict_page_label.config(text=f"Page {self.predict_current_page + 1} / {max(1, total_pages)}")
+
+    def clear_predicts_filters(self):
+        self.predict_search_var.set("")
+        self.predict_current_page = 0
+        self.refresh_predicts_view()
+
+    def refresh_livep_view(self):
+        if not hasattr(self, "livep_tree"):
+            return
+        for item in self.livep_tree.get_children():
+            self.livep_tree.delete(item)
+        term = self.livep_search_var.get().strip().lower()
+        filtered = self.livep
+        if term:
+            filtered = [p for p in self.livep if term in str(p.get("timestamp", ""))]
+        total_pages = (len(filtered) + self.livep_page_size - 1) // self.livep_page_size
+        start = self.livep_current_page * self.livep_page_size
+        page_data = filtered[start:start + self.livep_page_size]
+        for p in page_data:
+            self.livep_tree.insert("", "end", values=(
+                p.get("timestamp", ""),
+                p.get("next_diff_adj", ""),
+                p.get("est_hr", ""),
+                p.get("est_price", ""),
+                p.get("est_tx", ""),
+                p.get("est_nonce", ""),
+                p.get("win_nonce", "")
+            ))
+        self.livep_page_label.config(text=f"Page {self.livep_current_page + 1} / {max(1, total_pages)}")
+
+    def clear_livep_filters(self):
+        self.livep_search_var.set("")
+        self.livep_current_page = 0
+        self.refresh_livep_view()
+
+    def prev_page(self):
+        if self.current_page > 0:
+            self.current_page -= 1
+            self.refresh_notebook_view()
+
+    def next_page(self):
+        self.current_page += 1
+        self.refresh_notebook_view()
+
+    def prev_predict_page(self):
+        if self.predict_current_page > 0:
+            self.predict_current_page -= 1
+            self.refresh_predicts_view()
+
+    def next_predict_page(self):
+        self.predict_current_page += 1
+        self.refresh_predicts_view()
+
+    def prev_livep_page(self):
+        if self.livep_current_page > 0:
+            self.livep_current_page -= 1
+            self.refresh_livep_view()
+
+    def next_livep_page(self):
+        self.livep_current_page += 1
+        self.refresh_livep_view()
+
+    def pre_fill_all_notebooks(self):
+        self.queue_update("🔄 Pre-filling notebook data at startup...")
 
     def load_api_flags(self):
         for name in self.api_settings:
             self.api_flags[name] = {"status": "green", "cooldown_until": 0, "error_count": 0}
-
-    def save_api_flags(self):
-        pass
 
     def _safe_timestamp(self, time_val):
         if isinstance(time_val, (int, float)):
@@ -361,7 +560,7 @@ class BTCBlockPredictorGUI(tk.Tk):
         n = len(self.cache)
         tip = self.get_current_height()
         cached_max = max((int(h) for h in self.cache.keys()), default=0) if n > 0 else 0
-        welcome = "👋Thank you for using BBTP!\n"
+        welcome = "👋 Thank you for using BBTP!\n"
         if self.new_cache_created_on_startup:
             welcome += f"🆕 Created new persistent file: {CACHE_FILE}\n"
         welcome += f"🆕 BTC.chain archive ready\n"
@@ -370,7 +569,6 @@ class BTCBlockPredictorGUI(tk.Tk):
         welcome += "• Full Backward = everything from genesis (slow)\n"
         welcome += "• Refresh = fixes incomplete blocks\n"
         welcome += "• Use ⚙️ L&R to control what appears in this log\n"
-        welcome += "• Live Predictions update automatically on every new block\n"
         self.log_area.insert(tk.END, welcome + "\n")
 
     def on_closing(self):
@@ -654,7 +852,7 @@ class BTCBlockPredictorGUI(tk.Tk):
             current = max(int(h) for h in self.cache.keys())
             block = self.cache[str(current)]
             entry = {
-                "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                "timestamp": int(time.time()),
                 "next_diff_adj": DIFFICULTY_EPOCH - (current % DIFFICULTY_EPOCH),
                 "est_hr": block.get("estimated_hashrate", 0),
                 "est_price": block.get("price_usd", 0),
@@ -677,8 +875,6 @@ class BTCBlockPredictorGUI(tk.Tk):
             prev = self.cache[sorted_h[1]] if len(sorted_h) > 1 else last
             hr_trend = 2 if last.get("estimated_hashrate", 0) > prev.get("estimated_hashrate", 0) else 1 if last.get("estimated_hashrate", 0) < prev.get("estimated_hashrate", 0) else 0
             price_trend = 2 if last.get("price_usd", 0) > prev.get("price_usd", 0) else 1 if last.get("price_usd", 0) < prev.get("price_usd", 0) else 0
-            hr_avg50 = sum(b.get("estimated_hashrate", 0) for b in recent) / len(recent)
-            price_avg50 = sum(b.get("price_usd", 0) for b in recent) / len(recent)
             self.prediction_adjusters["hr_trend"] = hr_trend
             self.prediction_adjusters["price_trend"] = price_trend
             self.prediction_adjusters["last_trend_adjust"] = time.time()
@@ -689,9 +885,9 @@ class BTCBlockPredictorGUI(tk.Tk):
         error_rate = self.prediction_adjusters.get("error_rate", 0.0)
         multiplier = 1.0
         if trend == 2:
-            multiplier = 1.08
+            multiplier = 1.04
         elif trend == 1:
-            multiplier = 0.92
+            multiplier = 0.96
         if error_rate > 0.2:
             multiplier *= 0.85
         return round(est_value * multiplier, 4 if field == "hr" else 2)
@@ -1019,8 +1215,8 @@ class BTCBlockPredictorGUI(tk.Tk):
             avg_price = sum(b.get("price_usd", 0) for b in recent_blocks if "price_usd" in b) / len(recent_blocks) if recent_blocks else 70000
             avg_tx = sum(b.get("tx_count", 0) for b in recent_blocks) / len(recent_blocks) if recent_blocks else 3000
             blocks_until_adjustment = DIFFICULTY_EPOCH - (current % DIFFICULTY_EPOCH)
-            est_hr = self.adjust_prediction(avg_hr * (1 + (target - current) * 0.00008), "hr")
-            est_price = self.adjust_prediction(avg_price * (1 + (target - current) * 0.00006), "price")
+            est_hr = self.adjust_prediction(avg_hr * (1 + (target - current) * 0.0000235), "hr")
+            est_price = self.adjust_prediction(avg_price * (1 + (target - current) * 0.00002), "price")
             est_tx = int(avg_tx * 1.015)
         nonce_text = f"{self.last_est_nonce}" if self.last_est_nonce is not None else "0"
         win_text = f"{self.last_win_nonce}" if self.last_win_nonce is not None else "1337"
@@ -1038,30 +1234,52 @@ class BTCBlockPredictorGUI(tk.Tk):
             return
         self.maths_win = tk.Toplevel(self)
         self.maths_win.title("📐 Maths Behind BBTP")
+        self.maths_win.minsize(900, 650)
         width = self.winfo_width()
         self.maths_win.geometry(f"{width}x700")
+
+        nav = ttk.Frame(self.maths_win)
+        nav.pack(side="bottom", fill="x", padx=10, pady=5)
+        ttk.Label(nav, text="Page 1 / 1").pack(side="left")
+        ttk.Button(nav, text="◀ Prev", state="disabled").pack(side="left", padx=5)
+        ttk.Button(nav, text="Next ▶", state="disabled").pack(side="left")
+        self.hsb_maths = ttk.Scrollbar(nav, orient="horizontal", command=self.scroll_maths_y)
+        self.hsb_maths.pack(side="left", fill="x", expand=True, padx=10)
+        ttk.Button(nav, text="↑", command=lambda: self.maths_tree.yview_scroll(-3, "units") if hasattr(self, "maths_tree") else None).pack(side="left")
+        ttk.Button(nav, text="↓", command=lambda: self.maths_tree.yview_scroll(3, "units") if hasattr(self, "maths_tree") else None).pack(side="left")
+
         cols = ("Function", "Formula", "Live Example", "Extra Formula", "Notes")
-        tree = ttk.Treeview(self.maths_win, columns=cols, show="headings", height=30)
+        style = ttk.Style()
+        style.configure("Treeview", rowheight=110)
+        self.maths_tree = ttk.Treeview(self.maths_win, columns=cols, show="headings", height=28, style="Treeview")
         for col in cols:
-            tree.heading(col, text=col)
-            tree.column(col, width=220, anchor="w")
-        tree.pack(fill="both", expand=True, padx=10, pady=10)
+            self.maths_tree.heading(col, text=col)
+            self.maths_tree.column(col, width=220 if col != "Notes" else 340, anchor="w", stretch=True, minwidth=200)
+        self.maths_tree.pack(side="top", fill="both", expand=True, padx=10, pady=5)
+
+        self.maths_tree.configure(yscrollcommand=self.set_maths_scroll)
+
         data = [
             ("Average Block Time", "avg_sec = (last_ts - first_ts) / (last_h - first_h)", f"avg_sec = {600} sec", "", "Used for all predictions"),
             ("Estimated Timestamp", "est_ts = last_ts + (target - current) * avg_sec", "est_ts = 1745000000", "", "Future block time"),
             ("Drift", "drift_days = (actual_time - ideal_time) / 86400", "Drift: +3.45 days", "ideal_time = GENESIS + height*600", "Positive = behind schedule"),
             ("BTD", "BTD = (t_hvb - t_hvb1) - (t_hvb1 - t_hvb2)", "BTD: 05:12", "Last diff: 09:45", "Short-term speed change"),
             ("Next Diff Adj", "blocks_until_adj = 2016 - (current % 2016)", "Next Diff Adj: 1234", "", "Blocks until next difficulty adjustment"),
-            ("Est Hashrate", "est_hr = avg_hr * (1 + (target - current) * 0.00008)", "Est Hashrate: 612.34 EH/s", "", "Linear growth estimate"),
-            ("Est Price", "est_price = avg_price * (1 + (target - current) * 0.00006)", "Est Price: $82,548.19", "", "Linear growth estimate"),
+            ("Est Hashrate", "est_hr = avg_hr * (1 + (target - current) * 0.0000235)", "Est Hashrate: 612.34 EH/s", "", "Linear growth estimate"),
+            ("Est Price", "est_price = avg_price * (1 + (target - current) * 0.00002)", "Est Price: $82,548.19", "", "Linear growth estimate"),
             ("HR/Price", "hr_price = est_hr / est_price", "HR/Price: 0.00742", "", "Ratio of hashrate to price"),
             ("Est Tx", "est_tx = avg_tx * 1.015", "Est Tx: 3124", "", "Slight linear growth"),
             ("Est Nonce", "Est Nonce = averaged estimators", "Est Nonce: 1234567890", "", "Smart nonce blending"),
             ("Potential Winning Nonce", "PWN = Est Nonce + 1337", "PWN: 1234569227", "", "Lucky offset"),
             ("Predict Block", "est_ts = last_ts + (target - current) * avg_sec", "est_ts = 1745000000", "", "Full prediction using average block time"),
         ]
+
         for row in data:
-            tree.insert("", "end", values=row)
+            wrapped_row = list(row)
+            wrapped_row[1] = self.advanced_math_wrap(wrapped_row[1], width=45)
+            wrapped_row[2] = self.advanced_math_wrap(wrapped_row[2], width=38)
+            wrapped_row[4] = self.advanced_math_wrap(wrapped_row[4], width=55)
+            self.maths_tree.insert("", "end", values=tuple(wrapped_row))
 
     def open_notebook(self):
         if hasattr(self, "notebook_win") and self.notebook_win.winfo_exists():
@@ -1069,8 +1287,21 @@ class BTCBlockPredictorGUI(tk.Tk):
             return
         self.notebook_win = tk.Toplevel(self)
         self.notebook_win.title("📖 BTC Notebook – BBTP.crumbs")
+        self.notebook_win.minsize(900, 650)
         width = self.winfo_width()
         self.notebook_win.geometry(f"{width}x780")
+
+        nav = ttk.Frame(self.notebook_win)
+        nav.pack(side="bottom", fill="x", padx=10, pady=5)
+        self.page_label = ttk.Label(nav, text="Page 1 / ?")
+        self.page_label.pack(side="left")
+        ttk.Button(nav, text="◀ Prev", command=self.prev_page).pack(side="left", padx=5)
+        ttk.Button(nav, text="Next ▶", command=self.next_page).pack(side="left")
+        self.hsb_notebook = ttk.Scrollbar(nav, orient="horizontal", command=self.scroll_notebook_y)
+        self.hsb_notebook.pack(side="left", fill="x", expand=True, padx=10)
+        ttk.Button(nav, text="↑", command=lambda: self.tree.yview_scroll(-3, "units") if hasattr(self, "tree") else None).pack(side="left")
+        ttk.Button(nav, text="↓", command=lambda: self.tree.yview_scroll(3, "units") if hasattr(self, "tree") else None).pack(side="left")
+
         top = ttk.Frame(self.notebook_win)
         top.pack(fill="x", padx=10, pady=8)
         ttk.Label(top, text="Search:").pack(side="left")
@@ -1086,75 +1317,19 @@ class BTCBlockPredictorGUI(tk.Tk):
         self.filter_max.pack(side="left", padx=5)
         ttk.Button(top, text="Apply", command=self.refresh_notebook_view).pack(side="left", padx=5)
         ttk.Button(top, text="Clear", command=self.clear_notebook_filters).pack(side="left")
-        cols = ("Height", "Epoch Time", "Leading 0s", "Hash", "Size", "Tx", "Nonce", "Difficulty", "Hashrate (EH/s)", "Price USD")
-        self.tree = ttk.Treeview(self.notebook_win, columns=cols, show="headings", height=28)
+
+        cols = ("Height", "Epoch Time", "Lead 0s", "Hash", "Size", "Tx", "Nonce", "Difficulty", "Hashrate (EH/s)", "Price (USD)")
+        style = ttk.Style()
+        style.configure("Treeview", rowheight=60)
+        self.tree = ttk.Treeview(self.notebook_win, columns=cols, show="headings", height=24, style="Treeview")
         for col in cols:
             self.tree.heading(col, text=col)
-            self.tree.column(col, width=110, anchor="center")
-        self.tree.pack(fill="both", expand=True, padx=10, pady=5)
-        nav = ttk.Frame(self.notebook_win)
-        nav.pack(fill="x", padx=10, pady=8)
-        self.page_label = ttk.Label(nav, text="Page 1 / ?")
-        self.page_label.pack(side="left")
-        ttk.Button(nav, text="◀ Prev", command=self.prev_page).pack(side="left", padx=5)
-        ttk.Button(nav, text="Next ▶", command=self.next_page).pack(side="left")
+            self.tree.column(col, width=110, anchor="center", stretch=True)
+        self.tree.pack(side="top", fill="both", expand=True, padx=10, pady=5)
+
+        self.tree.configure(yscrollcommand=self.set_notebook_scroll)
+
         self.page_size = 50
-        self.current_page = 0
-        self.refresh_notebook_view()
-
-    def refresh_notebook_view(self):
-        if not hasattr(self, "tree"):
-            return
-        for item in self.tree.get_children():
-            self.tree.delete(item)
-        try:
-            with open(CACHE_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if "__settings__" in data:
-                data.pop("__settings__")
-        except:
-            return
-        heights = sorted(int(h) for h in data.keys())
-        try:
-            fmin = int(self.filter_min.get() or 0)
-            fmax = int(self.filter_max.get() or 999999999)
-            heights = [h for h in heights if fmin <= h <= fmax]
-        except:
-            pass
-        term = self.search_var.get().strip().lower()
-        if term:
-            heights = [h for h in heights if term in str(h) or term in str(data[str(h)].get("hash", "")).lower()]
-        total_pages = (len(heights) + self.page_size - 1) // self.page_size
-        start = self.current_page * self.page_size
-        page_heights = heights[start:start + self.page_size]
-        for h in page_heights:
-            b = data[str(h)]
-            hash_str = str(b.get("hash", ""))
-            stripped = hash_str.lstrip("0")
-            leading_zeros = len(hash_str) - len(stripped) if hash_str else 0
-            display_hash = f"{stripped[:6]}...{stripped[-6:]}" if len(stripped) > 12 else stripped or "—"
-            self.tree.insert("", "end", values=(
-                h, b.get("time", 0), leading_zeros, display_hash,
-                b.get("size", ""), b.get("tx_count", ""), b.get("nonce", ""),
-                f"{b.get('difficulty', 0):.2f}" if b.get("difficulty") else "",
-                f"{b.get('estimated_hashrate', 0):.4f}" if b.get("estimated_hashrate") else "",
-                f"${b.get('price_usd', 0):,.2f}" if b.get("price_usd") else ""
-            ))
-        self.page_label.config(text=f"Page {self.current_page + 1} / {max(1, total_pages)}")
-
-    def prev_page(self):
-        if self.current_page > 0:
-            self.current_page -= 1
-            self.refresh_notebook_view()
-
-    def next_page(self):
-        self.current_page += 1
-        self.refresh_notebook_view()
-
-    def clear_notebook_filters(self):
-        self.filter_min.delete(0, tk.END)
-        self.filter_max.delete(0, tk.END)
-        self.search_var.set("")
         self.current_page = 0
         self.refresh_notebook_view()
 
@@ -1164,8 +1339,21 @@ class BTCBlockPredictorGUI(tk.Tk):
             return
         self.predicts_win = tk.Toplevel(self)
         self.predicts_win.title("📓 Predicts Notebook – predicts.block")
+        self.predicts_win.minsize(900, 650)
         width = self.winfo_width()
         self.predicts_win.geometry(f"{width}x780")
+
+        nav = ttk.Frame(self.predicts_win)
+        nav.pack(side="bottom", fill="x", padx=10, pady=5)
+        self.predict_page_label = ttk.Label(nav, text="Page 1 / ?")
+        self.predict_page_label.pack(side="left")
+        ttk.Button(nav, text="◀ Prev", command=self.prev_predict_page).pack(side="left", padx=5)
+        ttk.Button(nav, text="Next ▶", command=self.next_predict_page).pack(side="left")
+        self.hsb_predicts = ttk.Scrollbar(nav, orient="horizontal", command=self.scroll_predicts_y)
+        self.hsb_predicts.pack(side="left", fill="x", expand=True, padx=10)
+        ttk.Button(nav, text="↑", command=lambda: self.predict_tree.yview_scroll(-3, "units") if hasattr(self, "predict_tree") else None).pack(side="left")
+        ttk.Button(nav, text="↓", command=lambda: self.predict_tree.yview_scroll(3, "units") if hasattr(self, "predict_tree") else None).pack(side="left")
+
         top = ttk.Frame(self.predicts_win)
         top.pack(fill="x", padx=10, pady=8)
         ttk.Label(top, text="Search:").pack(side="left")
@@ -1174,36 +1362,20 @@ class BTCBlockPredictorGUI(tk.Tk):
         search_entry.pack(side="left", padx=5)
         search_entry.bind("<KeyRelease>", lambda e: self.refresh_predicts_view())
         ttk.Button(top, text="Clear", command=self.clear_predicts_filters).pack(side="left", padx=5)
+
         cols = ("Target Block", "Predicted Time", "Delta Days", "Est Hashrate", "Est Price", "Est Tx", "Timestamp")
-        self.predict_tree = ttk.Treeview(self.predicts_win, columns=cols, show="headings", height=28)
+        style = ttk.Style()
+        style.configure("Treeview", rowheight=60)
+        self.predict_tree = ttk.Treeview(self.predicts_win, columns=cols, show="headings", height=24, style="Treeview")
         for col in cols:
             self.predict_tree.heading(col, text=col)
-            self.predict_tree.column(col, width=140, anchor="center")
-        self.predict_tree.pack(fill="both", expand=True, padx=10, pady=5)
-        self.refresh_predicts_view()
+            self.predict_tree.column(col, width=140, anchor="center", stretch=True)
+        self.predict_tree.pack(side="top", fill="both", expand=True, padx=10, pady=5)
 
-    def refresh_predicts_view(self):
-        if not hasattr(self, "predict_tree"):
-            return
-        for item in self.predict_tree.get_children():
-            self.predict_tree.delete(item)
-        term = self.predict_search_var.get().strip().lower()
-        filtered = self.predicts
-        if term:
-            filtered = [p for p in self.predicts if term in str(p.get("target", "")) or term in str(p.get("est_time_str", ""))]
-        for p in filtered:
-            self.predict_tree.insert("", "end", values=(
-                p.get("target", ""),
-                p.get("est_time_str", ""),
-                f"{p.get('delta_days', 0):+.2f}",
-                p.get("est_hr", ""),
-                p.get("est_price", ""),
-                p.get("est_tx", ""),
-                p.get("timestamp_str", "")
-            ))
+        self.predict_tree.configure(yscrollcommand=self.set_predicts_scroll)
 
-    def clear_predicts_filters(self):
-        self.predict_search_var.set("")
+        self.predict_page_size = 50
+        self.predict_current_page = 0
         self.refresh_predicts_view()
 
     def open_livep_notebook(self):
@@ -1212,8 +1384,21 @@ class BTCBlockPredictorGUI(tk.Tk):
             return
         self.livep_win = tk.Toplevel(self)
         self.livep_win.title("📓 Live Predictions Notebook – LiveP.btc")
+        self.livep_win.minsize(900, 650)
         width = self.winfo_width()
         self.livep_win.geometry(f"{width}x780")
+
+        nav = ttk.Frame(self.livep_win)
+        nav.pack(side="bottom", fill="x", padx=10, pady=5)
+        self.livep_page_label = ttk.Label(nav, text="Page 1 / ?")
+        self.livep_page_label.pack(side="left")
+        ttk.Button(nav, text="◀ Prev", command=self.prev_livep_page).pack(side="left", padx=5)
+        ttk.Button(nav, text="Next ▶", command=self.next_livep_page).pack(side="left")
+        self.hsb_livep = ttk.Scrollbar(nav, orient="horizontal", command=self.scroll_livep_y)
+        self.hsb_livep.pack(side="left", fill="x", expand=True, padx=10)
+        ttk.Button(nav, text="↑", command=lambda: self.livep_tree.yview_scroll(-3, "units") if hasattr(self, "livep_tree") else None).pack(side="left")
+        ttk.Button(nav, text="↓", command=lambda: self.livep_tree.yview_scroll(3, "units") if hasattr(self, "livep_tree") else None).pack(side="left")
+
         top = ttk.Frame(self.livep_win)
         top.pack(fill="x", padx=10, pady=8)
         ttk.Label(top, text="Search:").pack(side="left")
@@ -1222,40 +1407,36 @@ class BTCBlockPredictorGUI(tk.Tk):
         search_entry.pack(side="left", padx=5)
         search_entry.bind("<KeyRelease>", lambda e: self.refresh_livep_view())
         ttk.Button(top, text="Clear", command=self.clear_livep_filters).pack(side="left", padx=5)
-        cols = ("Timestamp", "Next Diff Adj", "Est Hashrate", "Est Price", "Est Tx", "Est Nonce", "Potential Winning Nonce")
-        self.livep_tree = ttk.Treeview(self.livep_win, columns=cols, show="headings", height=28)
+
+        cols = ("Epoch Time", "Next Diff Adj", "Est Hashrate", "Est Price", "Est Tx", "Est Nonce", "PWN")
+        style = ttk.Style()
+        style.configure("Treeview", rowheight=60)
+        self.livep_tree = ttk.Treeview(self.livep_win, columns=cols, show="headings", height=24, style="Treeview")
         for col in cols:
             self.livep_tree.heading(col, text=col)
-            self.livep_tree.column(col, width=140, anchor="center")
-        self.livep_tree.pack(fill="both", expand=True, padx=10, pady=5)
-        self.refresh_livep_view()
+            self.livep_tree.column(col, width=140, anchor="center", stretch=True)
+        self.livep_tree.pack(side="top", fill="both", expand=True, padx=10, pady=5)
 
-    def refresh_livep_view(self):
-        if not hasattr(self, "livep_tree"):
-            return
-        for item in self.livep_tree.get_children():
-            self.livep_tree.delete(item)
-        term = self.livep_search_var.get().strip().lower()
-        filtered = self.livep
-        if term:
-            filtered = [p for p in self.livep if term in str(p.get("timestamp", ""))]
-        for p in filtered:
-            self.livep_tree.insert("", "end", values=(
-                p.get("timestamp", ""),
-                p.get("next_diff_adj", ""),
-                p.get("est_hr", ""),
-                p.get("est_price", ""),
-                p.get("est_tx", ""),
-                p.get("est_nonce", ""),
-                p.get("win_nonce", "")
-            ))
+        self.livep_tree.configure(yscrollcommand=self.set_livep_scroll)
 
-    def clear_livep_filters(self):
-        self.livep_search_var.set("")
+        self.livep_page_size = 50
+        self.livep_current_page = 0
         self.refresh_livep_view()
 
     def queue_update(self, message: str):
+        if self.log_settings.get("debug_data", False):
+            epoch = int(time.time())
+            message = f"[{epoch}] {message}"
         self.update_queue.put(("log", message))
+        if any(self.log_settings.get(k, False) for k in ["debug_data", "export_logs", "persistence_logs"]):
+            try:
+                with open(LOG_FILE, "a", encoding="utf-8") as f:
+                    if not os.path.exists(LOG_FILE) or os.path.getsize(LOG_FILE) == 0:
+                        header = f"BBTP.log HEADER - Debug: {self.log_settings.get('debug_data')}, Export: {self.log_settings.get('export_logs')}, Persistence: {self.log_settings.get('persistence_logs')}\n"
+                        f.write(header)
+                    f.write(message + "\n")
+            except:
+                pass
         if hasattr(self, "log_area"):
             self.after(10, self.process_queue)
         else:
@@ -1410,6 +1591,8 @@ class BTCBlockPredictorGUI(tk.Tk):
             self.tip_epoch.config(text=f"Epoch: {epoch_ts}")
             self.tip_price.config(text=f"Price: ${block.get('price_usd', 0):,.2f}")
             self.tip_hr.config(text=f"HR: {block.get('estimated_hashrate', 0):.4f} EH/s")
+            self.tip_tx.config(text=f"Tx: {block.get('tx_count', 0):,}")
+            self.tip_hr_price.config(text=f"HR/Price: {block.get('estimated_hashrate', 0) / block.get('price_usd', 1):.6f}")
             self.tip_nonce.config(text=f"Nonce: {self.current_tip_nonce}")
             self.tip_leading_zeros.config(text=f"Leading 0s: {leading_zeros}")
             self.tip_hash.config(text=f"Hash: {stripped}")
@@ -1461,10 +1644,10 @@ class BTCBlockPredictorGUI(tk.Tk):
 
     def periodic_notebook_refresh(self):
         if not self.cooldown_active:
-            self.after(666000, self.periodic_notebook_refresh)
+            self.after(60000, self.periodic_notebook_refresh)
             return
         time.sleep(60)
-        self.after(666000, self.periodic_notebook_refresh)
+        self.after(60000, self.periodic_notebook_refresh)
 
     def open_data_settings(self):
         win = tk.Toplevel(self)
@@ -1571,12 +1754,18 @@ class BTCBlockPredictorGUI(tk.Tk):
     def save_log_settings(self, win):
         for key in self.log_settings:
             self.log_settings[key] = getattr(self, f"log_var_{key}").get()
+        if self.log_settings["debug_data"] and not self.log_settings["export_logs"]:
+            self.log_settings["export_logs"] = True
+            self.queue_update("🔄 Auto-enabled Export Logs because Debug Data is on")
+        if not self.log_settings["export_logs"] and self.log_settings["debug_data"]:
+            self.log_settings["debug_data"] = False
+            self.queue_update("🔄 Auto-disabled Debug Data because Export Logs was turned off")
         self.save_all_settings()
         win.destroy()
         self.queue_update("✅ Log & Results settings saved")
 
     def create_widgets(self):
-        ttk.Label(self, text="🟠 BTC Block Time Predictor [BBTP]", font=("Helvetica", 18, "bold")).pack(pady=10)
+        ttk.Label(self, text="🟠 BTC Block Time Predictor", font=("Helvetica", 18, "bold")).pack(pady=10)
 
         sf = ttk.LabelFrame(self, text="Live Status", padding=10)
         sf.pack(fill="x", padx=15, pady=5)
@@ -1661,12 +1850,16 @@ class BTCBlockPredictorGUI(tk.Tk):
         self.tip_price.grid(row=0, column=2, padx=12, pady=4, sticky="w")
         self.tip_hr = ttk.Label(tip_frame, text="HR: —", anchor="w")
         self.tip_hr.grid(row=0, column=3, padx=12, pady=4, sticky="w")
+        self.tip_tx = ttk.Label(tip_frame, text="Tx: —", anchor="w")
+        self.tip_tx.grid(row=1, column=0, padx=12, pady=4, sticky="w")
+        self.tip_hr_price = ttk.Label(tip_frame, text="HR/Price: —", anchor="w")
+        self.tip_hr_price.grid(row=1, column=1, padx=12, pady=4, sticky="w")
         self.tip_nonce = ttk.Label(tip_frame, text="Nonce: —", anchor="w")
-        self.tip_nonce.grid(row=1, column=0, padx=12, pady=4, sticky="w")
+        self.tip_nonce.grid(row=1, column=2, padx=12, pady=4, sticky="w")
         self.tip_leading_zeros = ttk.Label(tip_frame, text="Leading 0s: —", anchor="w")
-        self.tip_leading_zeros.grid(row=1, column=1, padx=12, pady=4, sticky="w")
+        self.tip_leading_zeros.grid(row=1, column=3, padx=12, pady=4, sticky="w")
         self.tip_hash = ttk.Label(tip_frame, text="Hash: —", anchor="w", wraplength=400)
-        self.tip_hash.grid(row=1, column=2, columnspan=2, padx=12, pady=4, sticky="w")
+        self.tip_hash.grid(row=2, column=0, columnspan=4, padx=12, pady=4, sticky="w")
         for i in range(4):
             tip_frame.columnconfigure(i, weight=1)
 
@@ -1694,7 +1887,10 @@ class BTCBlockPredictorGUI(tk.Tk):
         self.log_area = scrolledtext.ScrolledText(lf, height=14, font=("Consolas", 10))
         self.log_area.pack(fill="both", expand=True)
 
-        ttk.Label(self, text=f"Persistent file: {CACHE_FILE} | Chain file: {BTC_CHAIN_FILE} | Predicts: {PREDICTS_FILE} | LiveP: {LIVEP_FILE}", font=("Helvetica", 9), foreground="gray").pack(pady=5)
+        footer_text = f"Persistent file: {CACHE_FILE} | Chain file: {BTC_CHAIN_FILE} | Predicts: {PREDICTS_FILE} | LiveP: {LIVEP_FILE}"
+        ttk.Label(self, text=footer_text, font=("Helvetica", 9), foreground="gray", anchor="center").pack(side="bottom", fill="x", pady=5)
+
+        self.update_idletasks()
 
 if __name__ == "__main__":
     app = BTCBlockPredictorGUI()
