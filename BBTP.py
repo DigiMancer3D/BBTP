@@ -25,7 +25,6 @@ DATA_SETTINGS_FILE = "data_settings.json"
 API_SETTINGS_FILE = "api_settings.json"
 LOG_FILE = "BBTP.log"
 TEMP_FILE = "BBTP.temp"
-
 GENESIS_TIMESTAMP = 1231006505
 DIFFICULTY_EPOCH = 2016
 
@@ -237,10 +236,7 @@ class BTCBlockPredictorGUI(tk.Tk):
         self.geometry("1420x980")
         self.minsize(900, 650)
         self.resizable(True, True)
-
-        # === LOAD bbtp-icon.png FOR WINDOW / TASK MANAGER ===
         self.set_window_icon()
-
         self.update_queue = queue.Queue()
         self.cache: Dict[str, dict] = {}
         self.chain: Dict[str, dict] = {}
@@ -280,6 +276,26 @@ class BTCBlockPredictorGUI(tk.Tk):
         self.unfinished_work = []
         self.debug_active = False
 
+        self.last_tip_level_height = 0
+        self.previous_highest_100_hash = None
+
+        self.livep_settings = {
+            "max_entries": 500,
+            "show_hr": True,
+            "show_price": True,
+            "show_tx": True,
+            "show_nonce": True,
+            "show_win_nonce": True,
+            "drift_weight": 0.15,
+            "slope_sensitivity": 0.0008,
+            "ema_alpha": 0.1,
+            "short_term_threshold": 500,
+            "tx_growth_factor": 1.015,
+            "estimate_blend_ratio": 0.60
+        }
+
+        self.show_live_prediction_notifications = False
+
         self.data_settings = {
             "timestamp": True, "hash": True, "size": True, "tx_count": True,
             "nonce": True, "difficulty": True, "hashrate": True, "price": True,
@@ -294,7 +310,8 @@ class BTCBlockPredictorGUI(tk.Tk):
         self.log_settings = {
             "debug_data": False, "welcome_kit": True, "smart_welcome": False,
             "dumb_welcome": False, "no_seq_repeats": False, "no_repeats": False,
-            "export_logs": False, "persistence_logs": False
+            "export_logs": False, "persistence_logs": False,
+            "live_predictions": False
         }
 
         self.load_all_settings()
@@ -304,6 +321,7 @@ class BTCBlockPredictorGUI(tk.Tk):
 
         try:
             self.load_cache()
+            self.repair_cache_times()          # ← FIXED: repairs any string timestamps
             self.load_chain()
             self.load_predicts()
             self.load_livep()
@@ -327,11 +345,10 @@ class BTCBlockPredictorGUI(tk.Tk):
         self.after(1000, self.periodic_new_block_checker)
         self.after(60000, self.periodic_notebook_refresh)
         self.after(300, self.live_timer)
-
+        self.after(7900, self._trigger_startup_live_prediction)
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
 
     def set_window_icon(self):
-        """Load bbtp-icon.png for window / task manager"""
         icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bbtp-icon.png")
         try:
             if os.path.exists(icon_path):
@@ -340,13 +357,471 @@ class BTCBlockPredictorGUI(tk.Tk):
                 self._icon_image = photo
                 print("✅ Loaded bbtp-icon.png for window / task manager")
                 return
-            else:
-                print("⚠️ bbtp-icon.png not found next to BBTP.py")
         except Exception as e:
             print(f"⚠️ Window icon load failed: {e}")
         print("⚠️ Using no icon for window (PNG missing)")
 
-    # === ALL OTHER METHODS (unchanged) ===
+    # ====================== NEW HELPER METHODS FOR ADVANCED PREDICTION ======================
+    def _find_pair(self, heights: list, base: int, distance: int = 2016, tolerance: int = 30) -> int:
+        target = base - distance
+        for offset in range(-tolerance, tolerance + 1):
+            if target + offset in heights:
+                return target + offset
+            if target - offset in heights:
+                return target - offset
+        return target
+
+    # ====================== NEW SAFE TIME METHODS (FIX) ======================
+    def _safe_time(self, val) -> int:
+        """Always returns an integer timestamp, never a string"""
+        if isinstance(val, (int, float)):
+            return int(val)
+        if isinstance(val, str):
+            try:
+                return int(val)
+            except:
+                return 0
+        return 0
+
+    def repair_cache_times(self):
+        """One-time repair for any blocks that still have 'time' stored as string"""
+        fixed = 0
+        with self.cache_lock:
+            for h_str, block in self.cache.items():
+                if isinstance(block.get("time"), str):
+                    block["time"] = self._safe_time(block.get("time"))
+                    fixed += 1
+        if fixed > 0:
+            self.save_cache(force=True)
+            self.queue_update(f"🔧 Repaired {fixed:,} blocks with string timestamps")
+
+    def _get_smart_averages(self) -> dict:
+        with self.cache_lock:
+            heights = sorted(int(h) for h in self.cache.keys())
+            if len(heights) < 100:
+                return {"avg_sec": 600.0, "avg_hr": 600.0, "avg_price": 70000.0, "avg_tx": 3000.0}
+            newest = heights[-1]
+            oldest = heights[0]
+            pair_recent = [newest, self._find_pair(heights, newest)]
+            pair_historical = [oldest, self._find_pair(heights, oldest, distance=-2016)]
+            mid_idx = max(0, len(heights) // 2 - 500)
+            random_mid = heights[mid_idx]
+            pair_middle = [random_mid, self._find_pair(heights, random_mid)]
+
+            results = []
+            for pair in [pair_recent, pair_historical, pair_middle]:
+                h1, h2 = sorted(pair)
+                if h1 == h2: continue
+                b1 = self.cache[str(h1)]
+                b2 = self.cache[str(h2)]
+                t1 = self._safe_time(b1.get("time"))
+                t2 = self._safe_time(b2.get("time"))
+                interval = h2 - h1
+                if interval <= 0 or t2 <= t1:
+                    continue
+                results.append({
+                    "avg_sec": (t2 - t1) / interval,
+                    "avg_hr": (b1.get("estimated_hashrate", 0) + b2.get("estimated_hashrate", 0)) / 2,
+                    "avg_price": (b1.get("price_usd", 0) + b2.get("price_usd", 0)) / 2,
+                    "avg_tx": (b1.get("tx_count", 0) + b2.get("tx_count", 0)) / 2
+                })
+
+            if not results:
+                return {"avg_sec": 600.0, "avg_hr": 600.0, "avg_price": 70000.0, "avg_tx": 3000.0}
+
+            return {
+                "avg_sec": results[0]["avg_sec"] * 0.50 + results[2]["avg_sec"] * 0.30 + results[1]["avg_sec"] * 0.20,
+                "avg_hr": results[0]["avg_hr"] * 0.55 + results[2]["avg_hr"] * 0.30 + results[1]["avg_hr"] * 0.15,
+                "avg_price": results[0]["avg_price"] * 0.60 + results[2]["avg_price"] * 0.25 + results[1]["avg_price"] * 0.15,
+                "avg_tx": results[0]["avg_tx"] * 0.50 + results[2]["avg_tx"] * 0.30 + results[1]["avg_tx"] * 0.20
+            }
+
+    def _get_multi_window_averages(self) -> dict:
+        with self.cache_lock:
+            heights = sorted(int(h) for h in self.cache.keys())
+            n = len(heights)
+            if n < 100:
+                return {"avg_sec": 600.0, "avg_hr": 600.0, "avg_price": 70000.0, "avg_tx": 3000.0}
+
+            def window_avg(size):
+                size = min(size, n)
+                h1 = heights[-size]
+                h2 = heights[-1]
+                b1 = self.cache[str(h1)]
+                b2 = self.cache[str(h2)]
+                t1 = self._safe_time(b1.get("time"))
+                t2 = self._safe_time(b2.get("time"))
+                interval = h2 - h1
+                if interval <= 0 or t2 <= t1:
+                    return {"avg_sec": 600.0, "avg_hr": 600.0, "avg_price": 70000.0, "avg_tx": 3000.0}
+                return {
+                    "avg_sec": (t2 - t1) / interval,
+                    "avg_hr": (b1.get("estimated_hashrate", 0) + b2.get("estimated_hashrate", 0)) / 2,
+                    "avg_price": (b1.get("price_usd", 0) + b2.get("price_usd", 0)) / 2,
+                    "avg_tx": (b1.get("tx_count", 0) + b2.get("tx_count", 0)) / 2
+                }
+
+            w100 = window_avg(100)
+            w2016 = window_avg(2016)
+            w4032 = window_avg(4032)
+
+            return {
+                "avg_sec": w100["avg_sec"] * 0.40 + w2016["avg_sec"] * 0.35 + w4032["avg_sec"] * 0.25,
+                "avg_hr": w100["avg_hr"] * 0.40 + w2016["avg_hr"] * 0.35 + w4032["avg_hr"] * 0.25,
+                "avg_price": w100["avg_price"] * 0.40 + w2016["avg_price"] * 0.35 + w4032["avg_price"] * 0.25,
+                "avg_tx": w100["avg_tx"] * 0.40 + w2016["avg_tx"] * 0.35 + w4032["avg_tx"] * 0.25
+            }
+
+    def _compute_ema(self, values: list, alpha: float = None) -> float:
+        if alpha is None:
+            alpha = self.livep_settings["ema_alpha"]
+        if not values:
+            return 0.0
+        ema = values[0]
+        for v in values[1:]:
+            ema = alpha * v + (1 - alpha) * ema
+        return ema
+
+    def _get_slope(self, field: str = "hr", last_n: int = 100) -> float:
+        with self.cache_lock:
+            heights = sorted(int(h) for h in self.cache.keys())
+            recent = heights[-last_n:]
+            if len(recent) < 3:
+                return 0.0
+            xs = list(range(len(recent)))
+            if field == "hr":
+                ys = [self.cache[str(h)].get("estimated_hashrate", 0) for h in recent]
+            else:
+                ys = [self.cache[str(h)].get("price_usd", 0) for h in recent]
+            n = len(xs)
+            sumx = sum(xs)
+            sumy = sum(ys)
+            sumxy = sum(x * y for x, y in zip(xs, ys))
+            sumx2 = sum(x * x for x in xs)
+            denom = (n * sumx2 - sumx * sumx)
+            return (n * sumxy - sumx * sumy) / denom if denom != 0 else 0.0
+
+    def _get_latest_drift(self) -> float:
+        try:
+            with open(BR_CURVE_FILE, "r", encoding="utf-8") as f:
+                curve = json.load(f)
+            return curve[-1]["delta_days"] if curve else 0.0
+        except:
+            return 0.0
+
+    def _get_smart_nonce(self) -> tuple:
+        with self.cache_lock:
+            nonces = [b.get("nonce", 0) for b in self.cache.values()
+                      if isinstance(b.get("nonce"), (int, float)) and 1000000 < b.get("nonce") < 4294967295]
+            if len(nonces) < 10:
+                return 2147483648, 2147484985
+            recent = nonces[-200:]
+            mean_n = sum(recent) // len(recent)
+            std = max(50000000, int((max(recent) - min(recent)) * 0.3))
+            est = max(1000000, min(4294967295 - 200000, mean_n + random.randint(-std, std)))
+            win = est + random.randint(1000, 2000)
+            return int(est), int(win)
+
+    def _get_two_phase_estimate(self, current: int, blocks_until_adj: int, blended: dict) -> dict:
+        if blocks_until_adj > 300:
+            return blended
+        with self.cache_lock:
+            heights = sorted(int(h) for h in self.cache.keys())
+            diff_changes = [self.cache[str(h)].get("difficulty", 1.0) for h in heights[-500:]]
+        if len(diff_changes) >= 2:
+            last_change_pct = (diff_changes[-1] / diff_changes[-2]) - 1.0
+        else:
+            last_change_pct = 0.0
+        pre_sec = blended["avg_sec"]
+        post_hr = blended["avg_hr"] * (1 + last_change_pct)
+        post_sec = 600 * (blended["avg_hr"] / max(post_hr, 1.0))
+        weight_post = (300 - blocks_until_adj) / 300.0
+        blended["avg_sec"] = pre_sec * (1 - weight_post) + post_sec * weight_post
+        blended["avg_hr"] = blended["avg_hr"] * (1 - weight_post) + post_hr * weight_post
+        return blended
+
+    def _trigger_live_prediction_update(self, reason=""):
+        if len(self.cache) < 50:
+            return
+        current = max(int(h) for h in self.cache.keys())
+        self.update_prediction_labels(current + 1)
+        if self.log_settings.get("live_predictions", False):
+            self.queue_update(f"📈 Live prediction updated ({reason})")
+
+    def _trigger_startup_live_prediction(self):
+        self._trigger_live_prediction_update("startup_7.9s")
+
+    def _save_shutdown_prediction(self):
+        if len(self.cache) < 3:
+            return
+        with self.cache_lock:
+            current = max(int(h) for h in self.cache.keys())
+            block = self.cache[str(current)]
+            entry = {
+                "timestamp": int(time.time()),
+                "next_diff_adj": DIFFICULTY_EPOCH - (current % DIFFICULTY_EPOCH),
+                "est_hr": block.get("estimated_hashrate", 0),
+                "est_price": block.get("price_usd", 0),
+                "est_tx": block.get("tx_count", 0),
+                "est_nonce": self.last_est_nonce,
+                "win_nonce": self.last_win_nonce
+            }
+            self.livep.insert(0, entry)
+            if len(self.livep) > self.livep_settings["max_entries"]:
+                self.livep = self.livep[:self.livep_settings["max_entries"]]
+        self.save_livep()
+        if self.log_settings.get("live_predictions", False):
+            self.queue_update("💾 Shutdown prediction saved to LiveP.btc")
+
+    def adjust_prediction(self, est_value: float, field: str) -> float:
+        slope = self._get_slope(field, last_n=80)
+        multiplier = 1.0 + (slope * self.livep_settings["slope_sensitivity"])
+        if self.prediction_adjusters.get("error_rate", 0.0) > 0.2:
+            multiplier *= 0.88
+        return round(est_value * multiplier, 4 if field == "hr" else 2)
+
+    def update_prediction_labels(self, target: int):
+        if len(self.cache) < 50:
+            return
+        with self.cache_lock:
+            current = max(int(h) for h in self.cache.keys())
+        if target <= current:
+            return
+
+        smart = self._get_smart_averages()
+        multi = self._get_multi_window_averages()
+        blend = self.livep_settings["estimate_blend_ratio"]
+        base = {
+            "avg_sec": smart["avg_sec"] * blend + multi["avg_sec"] * (1 - blend),
+            "avg_hr": smart["avg_hr"] * blend + multi["avg_hr"] * (1 - blend),
+            "avg_price": smart["avg_price"] * blend + multi["avg_price"] * (1 - blend),
+            "avg_tx": smart["avg_tx"] * blend + multi["avg_tx"] * (1 - blend)
+        }
+
+        with self.cache_lock:
+            heights = sorted(int(h) for h in self.cache.keys())
+            hrs = [self.cache[str(h)].get("estimated_hashrate", 0) for h in heights[-1000:]]
+            prices = [self.cache[str(h)].get("price_usd", 0) for h in heights[-1000:]]
+        base["avg_hr"] = self._compute_ema(hrs) * 0.6 + base["avg_hr"] * 0.4
+        base["avg_price"] = self._compute_ema(prices) * 0.6 + base["avg_price"] * 0.4
+
+        blocks_until_adj = DIFFICULTY_EPOCH - (current % DIFFICULTY_EPOCH)
+        base = self._get_two_phase_estimate(current, blocks_until_adj, base)
+
+        distance = target - current
+        short_threshold = self.livep_settings["short_term_threshold"]
+        if distance < short_threshold:
+            final_sec = base["avg_sec"] * 0.85 + smart["avg_sec"] * 0.15
+        else:
+            final_sec = base["avg_sec"] * 0.7 + self._compute_ema([b["avg_sec"] for b in [smart, multi]]) * 0.3
+
+        # Use safe time here too
+        current_time = self._safe_time(self.cache[str(current)].get("time"))
+        est_ts = current_time + int(distance * final_sec)
+        drift_days = self._get_latest_drift()
+        drift_correction = drift_days * 86400 * self.livep_settings["drift_weight"]
+        est_ts += int(drift_correction)
+        delta_days = (est_ts - (GENESIS_TIMESTAMP + target * 600)) / 86400.0
+        est_dt = datetime.fromtimestamp(est_ts)
+
+        est_hr = self.adjust_prediction(base["avg_hr"], "hr")
+        est_price = self.adjust_prediction(base["avg_price"], "price")
+        est_tx = int(base["avg_tx"] * self.livep_settings["tx_growth_factor"])
+        est_nonce, win_nonce = self._get_smart_nonce()
+
+        self.lbl_diff.config(text=f"Next Diff Adj: {blocks_until_adj}")
+        self.lbl_hr.config(text=f"Est Hashrate: {est_hr:.4f} EH/s")
+        self.lbl_price.config(text=f"Est Price: ${est_price:,.2f}")
+        self.lbl_ratio.config(text=f"HR/Price: {est_hr/est_price:.6f}")
+        self.lbl_tx.config(text=f"Est Tx: {est_tx:,}")
+        self.lbl_nonce.config(text=f"Est Nonce: {est_nonce}")
+        self.lbl_win_nonce.config(text=f"Potential Winning Nonce: {win_nonce}")
+
+        self._save_live_prediction_enhanced(est_hr, est_price, est_tx, est_nonce, win_nonce)
+
+    def _save_live_prediction_enhanced(self, est_hr, est_price, est_tx, est_nonce, win_nonce):
+        if len(self.cache) < 3:
+            return
+        with self.cache_lock:
+            current = max(int(h) for h in self.cache.keys())
+            entry = {
+                "timestamp": int(time.time()),
+                "next_diff_adj": DIFFICULTY_EPOCH - (current % DIFFICULTY_EPOCH),
+                "est_hr": round(est_hr, 4),
+                "est_price": round(est_price, 2),
+                "est_tx": est_tx,
+                "est_nonce": est_nonce,
+                "win_nonce": win_nonce
+            }
+            self.livep.insert(0, entry)
+            if len(self.livep) > self.livep_settings["max_entries"]:
+                self.livep = self.livep[:self.livep_settings["max_entries"]]
+        self.save_livep()
+
+    def predict_block(self):
+        if len(self.cache) < 50:
+            messagebox.showwarning("Too few blocks", "Need at least 50 blocks!")
+            return
+        try:
+            target = int(self.predict_entry.get().strip())
+        except:
+            messagebox.showerror("Error", "Valid block number")
+            return
+        with self.cache_lock:
+            current = max(int(h) for h in self.cache.keys())
+        if target <= current:
+            block = self.cache[str(target)]
+            dt = datetime.fromtimestamp(self._safe_time(block.get("time")))
+            msg = f"✅ Block {target:,} mined: {dt.strftime('%Y-%m-%d %H:%M:%S UTC')}"
+            self.log_area.insert(tk.END, msg + "\n")
+            self.log_area.see(tk.END)
+            return
+        smart = self._get_smart_averages()
+        multi = self._get_multi_window_averages()
+        blend = self.livep_settings["estimate_blend_ratio"]
+        base = {"avg_sec": smart["avg_sec"] * blend + multi["avg_sec"] * (1 - blend)}
+        distance = target - current
+        current_time = self._safe_time(self.cache[str(current)].get("time"))
+        est_ts = current_time + int(distance * base["avg_sec"])
+        drift_days = self._get_latest_drift()
+        est_ts += int(drift_days * 86400 * self.livep_settings["drift_weight"])
+        delta_days = (est_ts - (GENESIS_TIMESTAMP + target * 600)) / 86400.0
+        est_dt = datetime.fromtimestamp(est_ts)
+        msg = f"🚀 Prediction {target:,} → {est_dt.strftime('%Y-%m-%d %H:%M:%S UTC')} (Δ {delta_days:+.2f} days)"
+        self.log_area.insert(tk.END, msg + "\n")
+        self.log_area.see(tk.END)
+        entry = {
+            "target": target,
+            "est_time_str": est_dt.strftime('%Y-%m-%d %H:%M:%S UTC'),
+            "delta_days": round(delta_days, 2),
+            "est_hr": round(smart["avg_hr"], 4),
+            "est_price": round(smart["avg_price"], 2),
+            "est_tx": int(smart["avg_tx"] * self.livep_settings["tx_growth_factor"]),
+            "timestamp_str": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        }
+        self.predicts.append(entry)
+        self.save_predicts()
+        self._trigger_live_prediction_update("manual_predict_button")
+
+    def auto_update_predictions(self):
+        pass
+
+    def open_live_predictions_settings(self):
+        win = tk.Toplevel(self)
+        win.title("⚙️ Live Predictions Settings (LiveP.btc)")
+        win.geometry("720x680")
+        win.resizable(False, False)
+        ttk.Label(win, text="Live Predictions Settings", font=("Helvetica", 14, "bold")).pack(pady=10)
+        tile_frame = ttk.Frame(win)
+        tile_frame.pack(pady=10, padx=20, fill="both", expand=True)
+        ttk.Label(tile_frame, text="Max Entries in LiveP.btc", font=("Helvetica", 10, "bold")).grid(row=0, column=0, padx=10, pady=5, sticky="w")
+        max_var = tk.IntVar(value=self.livep_settings["max_entries"])
+        spin = ttk.Spinbox(tile_frame, from_=100, to=2000, increment=50, textvariable=max_var, width=10)
+        spin.grid(row=0, column=1, padx=5)
+        ttk.Button(tile_frame, text="↑", width=3, command=lambda: max_var.set(min(2000, max_var.get() + 50))).grid(row=0, column=2)
+        ttk.Button(tile_frame, text="↓", width=3, command=lambda: max_var.set(max(100, max_var.get() - 50))).grid(row=0, column=3)
+        row = 1
+        for key, label in [("show_hr", "Est Hashrate"), ("show_price", "Est Price"), ("show_tx", "Est Tx"),
+                           ("show_nonce", "Est Nonce"), ("show_win_nonce", "Potential Winning Nonce")]:
+            var = tk.BooleanVar(value=self.livep_settings[key])
+            ttk.Checkbutton(tile_frame, text=label, variable=var).grid(row=row, column=0, columnspan=4, pady=4, sticky="w")
+            setattr(self, f"livep_var_{key}", var)
+            row += 1
+        ttk.Label(tile_frame, text="Drift Correction Weight", font=("Helvetica", 10, "bold")).grid(row=row, column=0, padx=10, pady=5, sticky="w")
+        drift_var = tk.DoubleVar(value=self.livep_settings["drift_weight"])
+        spin_d = ttk.Spinbox(tile_frame, from_=0.01, to=1.0, increment=0.01, textvariable=drift_var, width=10)
+        spin_d.grid(row=row, column=1, padx=5)
+        ttk.Button(tile_frame, text="↑", width=3, command=lambda: drift_var.set(min(1.0, drift_var.get() + 0.01))).grid(row=row, column=2)
+        ttk.Button(tile_frame, text="↓", width=3, command=lambda: drift_var.set(max(0.01, drift_var.get() - 0.01))).grid(row=row, column=3)
+        setattr(self, "livep_var_drift_weight", drift_var)
+        row += 1
+        ttk.Label(tile_frame, text="Slope Sensitivity", font=("Helvetica", 10, "bold")).grid(row=row, column=0, padx=10, pady=5, sticky="w")
+        slope_var = tk.DoubleVar(value=self.livep_settings["slope_sensitivity"])
+        spin_s = ttk.Spinbox(tile_frame, from_=0.0001, to=0.01, increment=0.0001, textvariable=slope_var, width=10)
+        spin_s.grid(row=row, column=1, padx=5)
+        ttk.Button(tile_frame, text="↑", width=3, command=lambda: slope_var.set(min(0.01, slope_var.get() + 0.0001))).grid(row=row, column=2)
+        ttk.Button(tile_frame, text="↓", width=3, command=lambda: slope_var.set(max(0.0001, slope_var.get() - 0.0001))).grid(row=row, column=3)
+        setattr(self, "livep_var_slope_sensitivity", slope_var)
+        row += 1
+        ttk.Label(tile_frame, text="EMA Alpha (smoothing)", font=("Helvetica", 10, "bold")).grid(row=row, column=0, padx=10, pady=5, sticky="w")
+        ema_var = tk.DoubleVar(value=self.livep_settings["ema_alpha"])
+        spin_e = ttk.Spinbox(tile_frame, from_=0.01, to=0.5, increment=0.01, textvariable=ema_var, width=10)
+        spin_e.grid(row=row, column=1, padx=5)
+        ttk.Button(tile_frame, text="↑", width=3, command=lambda: ema_var.set(min(0.5, ema_var.get() + 0.01))).grid(row=row, column=2)
+        ttk.Button(tile_frame, text="↓", width=3, command=lambda: ema_var.set(max(0.01, ema_var.get() - 0.01))).grid(row=row, column=3)
+        setattr(self, "livep_var_ema_alpha", ema_var)
+        row += 1
+        ttk.Label(tile_frame, text="Short-term Threshold (blocks)", font=("Helvetica", 10, "bold")).grid(row=row, column=0, padx=10, pady=5, sticky="w")
+        short_var = tk.IntVar(value=self.livep_settings["short_term_threshold"])
+        spin_sh = ttk.Spinbox(tile_frame, from_=100, to=2000, increment=50, textvariable=short_var, width=10)
+        spin_sh.grid(row=row, column=1, padx=5)
+        ttk.Button(tile_frame, text="↑", width=3, command=lambda: short_var.set(min(2000, short_var.get() + 50))).grid(row=row, column=2)
+        ttk.Button(tile_frame, text="↓", width=3, command=lambda: short_var.set(max(100, short_var.get() - 50))).grid(row=row, column=3)
+        setattr(self, "livep_var_short_term_threshold", short_var)
+        row += 1
+        ttk.Label(tile_frame, text="Tx Count Growth Factor", font=("Helvetica", 10, "bold")).grid(row=row, column=0, padx=10, pady=5, sticky="w")
+        tx_var = tk.DoubleVar(value=self.livep_settings["tx_growth_factor"])
+        spin_tx = ttk.Spinbox(tile_frame, from_=0.9, to=1.1, increment=0.001, textvariable=tx_var, width=10)
+        spin_tx.grid(row=row, column=1, padx=5)
+        ttk.Button(tile_frame, text="↑", width=3, command=lambda: tx_var.set(min(1.1, tx_var.get() + 0.001))).grid(row=row, column=2)
+        ttk.Button(tile_frame, text="↓", width=3, command=lambda: tx_var.set(max(0.9, tx_var.get() - 0.001))).grid(row=row, column=3)
+        setattr(self, "livep_var_tx_growth_factor", tx_var)
+        row += 1
+        ttk.Label(tile_frame, text="Estimate Blend Ratio (Smart vs Multi-Window)", font=("Helvetica", 10, "bold")).grid(row=row, column=0, padx=10, pady=5, sticky="w")
+        blend_var = tk.DoubleVar(value=self.livep_settings["estimate_blend_ratio"])
+        spin_blend = ttk.Spinbox(tile_frame, from_=0.0, to=1.0, increment=0.05, textvariable=blend_var, width=10)
+        spin_blend.grid(row=row, column=1, padx=5)
+        ttk.Button(tile_frame, text="↑", width=3, command=lambda: blend_var.set(min(1.0, blend_var.get() + 0.05))).grid(row=row, column=2)
+        ttk.Button(tile_frame, text="↓", width=3, command=lambda: blend_var.set(max(0.0, blend_var.get() - 0.05))).grid(row=row, column=3)
+        setattr(self, "livep_var_estimate_blend_ratio", blend_var)
+        row += 1
+
+        def save_settings():
+            self.livep_settings["max_entries"] = max_var.get()
+            for key in ["show_hr", "show_price", "show_tx", "show_nonce", "show_win_nonce"]:
+                self.livep_settings[key] = getattr(self, f"livep_var_{key}").get()
+            self.livep_settings["drift_weight"] = getattr(self, "livep_var_drift_weight").get()
+            self.livep_settings["slope_sensitivity"] = getattr(self, "livep_var_slope_sensitivity").get()
+            self.livep_settings["ema_alpha"] = getattr(self, "livep_var_ema_alpha").get()
+            self.livep_settings["short_term_threshold"] = getattr(self, "livep_var_short_term_threshold").get()
+            self.livep_settings["tx_growth_factor"] = getattr(self, "livep_var_tx_growth_factor").get()
+            self.livep_settings["estimate_blend_ratio"] = getattr(self, "livep_var_estimate_blend_ratio").get()
+            if len(self.livep) > self.livep_settings["max_entries"]:
+                self.livep = self.livep[:self.livep_settings["max_entries"]]
+            self.save_livep()
+            win.destroy()
+            self.queue_update("✅ Live Predictions settings saved (including new blend ratio)")
+
+        ttk.Button(win, text="Save Settings", command=save_settings).pack(pady=20)
+
+    def open_log_settings(self):
+        win = tk.Toplevel(self)
+        win.title("⚙️ L&R Settings")
+        win.geometry("620x560")
+        ttk.Label(win, text="Log & Results Settings", font=("Helvetica", 12, "bold")).pack(pady=10)
+        frame = ttk.Frame(win)
+        frame.pack(fill="both", expand=True, padx=20, pady=10)
+        for key, default in self.log_settings.items():
+            var = tk.BooleanVar(value=default)
+            cb = ttk.Checkbutton(frame, text=key.replace("_", " ").title(), variable=var)
+            cb.pack(anchor="center")
+            setattr(self, f"log_var_{key}", var)
+        ttk.Button(win, text="Save", command=lambda: self.save_log_settings(win)).pack(pady=10)
+
+    def save_log_settings(self, win):
+        for key in self.log_settings:
+            self.log_settings[key] = getattr(self, f"log_var_{key}").get()
+        self.show_live_prediction_notifications = self.log_settings["live_predictions"]
+        if self.log_settings["debug_data"] and not self.log_settings["export_logs"]:
+            self.log_settings["export_logs"] = True
+            self.queue_update("🔄 Auto-enabled Export Logs because Debug Data is on")
+        if not self.log_settings["export_logs"] and self.log_settings["debug_data"]:
+            self.log_settings["debug_data"] = False
+            self.queue_update("🔄 Auto-disabled Debug Data because Export Logs was turned off")
+        self.save_all_settings()
+        win.destroy()
+        self.queue_update("✅ Log & Results settings saved")
+
     def advanced_math_wrap(self, text, width=48):
         if not text or len(str(text)) <= width:
             return str(text)
@@ -581,6 +1056,7 @@ class BTCBlockPredictorGUI(tk.Tk):
         if self.sync_running or self.refresh_running:
             self.sync_stop_event.set()
             time.sleep(1.2)
+        self._save_shutdown_prediction()
         self.save_window_size()
         self.save_all_settings()
         try:
@@ -751,6 +1227,10 @@ class BTCBlockPredictorGUI(tk.Tk):
             if added > 0:
                 self.save_chain()
                 self.queue_update(f"✅ Merged {added:,} complete blocks into BTC.chain")
+                current_max = max((int(h) for h in self.cache.keys()), default=0)
+                if current_max > self.last_tip_level_height:
+                    self.last_tip_level_height = current_max
+                    self._trigger_live_prediction_update("btc_chain_tip_level")
         except Exception as e:
             print(f"⚠️ Merge to chain failed: {e}")
 
@@ -801,7 +1281,6 @@ class BTCBlockPredictorGUI(tk.Tk):
                 self.save_chain()
             self.after(10, self.update_status)
             self.after(10, self.auto_update_predictions)
-            self._save_live_prediction()
         return data
 
     def _enrich_block(self, h_str: str):
@@ -845,26 +1324,6 @@ class BTCBlockPredictorGUI(tk.Tk):
                 self.last_est_nonce = max(0, min(avg_est, 4294967295))
             self.last_win_nonce = self.last_est_nonce + 1337
 
-    def _save_live_prediction(self):
-        if len(self.cache) < 3:
-            return
-        with self.cache_lock:
-            current = max(int(h) for h in self.cache.keys())
-            block = self.cache[str(current)]
-            entry = {
-                "timestamp": int(time.time()),
-                "next_diff_adj": DIFFICULTY_EPOCH - (current % DIFFICULTY_EPOCH),
-                "est_hr": block.get("estimated_hashrate", 0),
-                "est_price": block.get("price_usd", 0),
-                "est_tx": block.get("tx_count", 0),
-                "est_nonce": self.last_est_nonce,
-                "win_nonce": self.last_win_nonce
-            }
-            self.livep.insert(0, entry)
-            if len(self.livep) > 500:
-                self.livep = self.livep[:500]
-        self.save_livep()
-
     def calculate_trends(self):
         if len(self.cache) < 50:
             return
@@ -879,19 +1338,6 @@ class BTCBlockPredictorGUI(tk.Tk):
             self.prediction_adjusters["price_trend"] = price_trend
             self.prediction_adjusters["last_trend_adjust"] = time.time()
 
-    def adjust_prediction(self, est_value: float, field: str) -> float:
-        self.calculate_trends()
-        trend = self.prediction_adjusters.get(field + "_trend", 0)
-        error_rate = self.prediction_adjusters.get("error_rate", 0.0)
-        multiplier = 1.0
-        if trend == 2:
-            multiplier = 1.04
-        elif trend == 1:
-            multiplier = 0.96
-        if error_rate > 0.2:
-            multiplier *= 0.85
-        return round(est_value * multiplier, 4 if field == "hr" else 2)
-
     def refresh_cached_blocks(self):
         if self.sync_running or self.refresh_running:
             messagebox.showinfo("Busy", "Wait for current operation")
@@ -899,7 +1345,6 @@ class BTCBlockPredictorGUI(tk.Tk):
         if time.time() < self.data_api_cooldown_until:
             self.queue_update("⏳ Data APIs on cooldown")
             return
-
         with self.cache_lock:
             partial_count = sum(1 for b in self.cache.values() if not self._is_complete_block(b))
         if partial_count > 200:
@@ -916,7 +1361,6 @@ class BTCBlockPredictorGUI(tk.Tk):
             ttk.Button(frame, text="Top Quarter Only", command=lambda: self._start_refresh(win, "quarter")).grid(row=2, column=0, padx=5)
             ttk.Button(frame, text="Cancel Refresh", command=win.destroy).grid(row=2, column=1, padx=5)
             return
-
         self._start_refresh(None, "all")
 
     def _start_refresh(self, win, mode):
@@ -980,6 +1424,7 @@ class BTCBlockPredictorGUI(tk.Tk):
             self.save_chain()
             self.clear_temp_cache_if_empty(temp_file)
             self.queue_update(f"✅ Refresh complete – all {total_attempted:,} incomplete blocks updated")
+            self._trigger_live_prediction_update("refresh_highest_100")
         except Exception as e:
             self.queue_update(f"❌ Refresh error: {e}")
         finally:
@@ -1033,6 +1478,7 @@ class BTCBlockPredictorGUI(tk.Tk):
             self.session_oldest = tip
             self.session_top = tip
             fetched_in_batch = 0
+            new_block_counter = 0
             if mode == "quick":
                 self.current_sync_total = min(2000, gap + 1) + 100
             elif mode == "full":
@@ -1051,6 +1497,9 @@ class BTCBlockPredictorGUI(tk.Tk):
                         continue
                     if str(h) not in self.cache or not self._is_complete_block(self.cache.get(str(h), {})):
                         self.get_full_block(h, force_save=(fetched_in_batch % 30 == 0))
+                        new_block_counter += 1
+                        if new_block_counter % 3 == 0:
+                            self._trigger_live_prediction_update("historical_3rd_block")
                     self.session_fetched += 1
                     fetched_in_batch += 1
                     self.current_sync_fetched = fetched_in_batch
@@ -1072,6 +1521,9 @@ class BTCBlockPredictorGUI(tk.Tk):
                         continue
                     if str(h) not in self.cache or not self._is_complete_block(self.cache.get(str(h), {})):
                         self.get_full_block(h, force_save=(fetched_in_batch % 30 == 0))
+                        new_block_counter += 1
+                        if new_block_counter % 3 == 0:
+                            self._trigger_live_prediction_update("historical_3rd_block")
                     self.session_fetched += 1
                     fetched_in_batch += 1
                     self.current_sync_fetched = fetched_in_batch
@@ -1094,6 +1546,9 @@ class BTCBlockPredictorGUI(tk.Tk):
                         continue
                     if str(h) not in self.cache or not self._is_complete_block(self.cache.get(str(h), {})):
                         self.get_full_block(h, force_save=(fetched_in_batch % 30 == 0))
+                        new_block_counter += 1
+                        if new_block_counter % 3 == 0:
+                            self._trigger_live_prediction_update("historical_3rd_block")
                     self.session_fetched += 1
                     fetched_in_batch += 1
                     self.current_sync_fetched = fetched_in_batch
@@ -1130,6 +1585,10 @@ class BTCBlockPredictorGUI(tk.Tk):
             self.save_chain()
             self.clear_temp_cache_if_empty(temp_file)
             self.queue_update(f"✅ {mode.upper()} dynamic sync finished")
+            current_max = max((int(h) for h in self.cache.keys()), default=0)
+            if current_max >= self.get_current_height() and current_max > self.last_tip_level_height:
+                self.last_tip_level_height = current_max
+                self._trigger_live_prediction_update(f"{mode}_sync_tip_level")
         except Exception as e:
             self.queue_update(f"❌ Sync error: {e}")
         finally:
@@ -1171,6 +1630,7 @@ class BTCBlockPredictorGUI(tk.Tk):
         self.sync_stop_event.set()
         self.queue_update("⏹️ Stop signal sent...")
         self.btn_stop.config(state="disabled")
+        self._trigger_live_prediction_update("sync_cancelled")
 
     def live_timer(self):
         self.update_status()
@@ -1189,45 +1649,6 @@ class BTCBlockPredictorGUI(tk.Tk):
         else:
             self.live_progress.config(text=self.last_progress_text)
 
-    def auto_update_predictions(self):
-        if hasattr(self, "predict_entry") and self.predict_entry.get().strip():
-            try:
-                target = int(self.predict_entry.get().strip())
-                self.update_prediction_labels(target)
-            except:
-                pass
-
-    def update_prediction_labels(self, target: int):
-        if len(self.cache) < 3:
-            return
-        with self.cache_lock:
-            current = max(int(h) for h in self.cache.keys())
-        if target <= current:
-            return
-        with self.cache_lock:
-            all_heights = sorted(int(h) for h in self.cache.keys())
-            use = all_heights[-2016:] if len(all_heights) > 2016 else all_heights
-            t_start = self.cache[str(use[0])]["time"]
-            t_end = self.cache[str(use[-1])]["time"]
-            avg_sec = (t_end - t_start) / (use[-1] - use[0]) if len(use) > 1 else 600
-            recent_blocks = [b for b in self.cache.values() if "difficulty" in b]
-            avg_hr = sum(b.get("estimated_hashrate", 0) for b in recent_blocks) / len(recent_blocks) if recent_blocks else 600
-            avg_price = sum(b.get("price_usd", 0) for b in recent_blocks if "price_usd" in b) / len(recent_blocks) if recent_blocks else 70000
-            avg_tx = sum(b.get("tx_count", 0) for b in recent_blocks) / len(recent_blocks) if recent_blocks else 3000
-            blocks_until_adjustment = DIFFICULTY_EPOCH - (current % DIFFICULTY_EPOCH)
-            est_hr = self.adjust_prediction(avg_hr * (1 + (target - current) * 0.0000235), "hr")
-            est_price = self.adjust_prediction(avg_price * (1 + (target - current) * 0.00002), "price")
-            est_tx = int(avg_tx * 1.015)
-        nonce_text = f"{self.last_est_nonce}" if self.last_est_nonce is not None else "0"
-        win_text = f"{self.last_win_nonce}" if self.last_win_nonce is not None else "1337"
-        self.lbl_diff.config(text=f"Next Diff Adj: {blocks_until_adjustment}")
-        self.lbl_hr.config(text=f"Est Hashrate: {est_hr} EH/s")
-        self.lbl_price.config(text=f"Est Price: ${est_price:,.2f}")
-        self.lbl_ratio.config(text=f"HR/Price: {est_hr/est_price:.6f}")
-        self.lbl_tx.config(text=f"Est Tx: {est_tx:,}")
-        self.lbl_nonce.config(text=f"Est Nonce: {nonce_text}")
-        self.lbl_win_nonce.config(text=f"Potential Winning Nonce: {win_text}")
-
     def open_maths_window(self):
         if hasattr(self, "maths_win") and self.maths_win.winfo_exists():
             self.maths_win.lift()
@@ -1237,7 +1658,6 @@ class BTCBlockPredictorGUI(tk.Tk):
         self.maths_win.minsize(900, 650)
         width = self.winfo_width()
         self.maths_win.geometry(f"{width}x700")
-
         nav = ttk.Frame(self.maths_win)
         nav.pack(side="bottom", fill="x", padx=10, pady=5)
         ttk.Label(nav, text="Page 1 / 1").pack(side="left")
@@ -1247,7 +1667,6 @@ class BTCBlockPredictorGUI(tk.Tk):
         self.hsb_maths.pack(side="left", fill="x", expand=True, padx=10)
         ttk.Button(nav, text="↑", command=lambda: self.maths_tree.yview_scroll(-3, "units") if hasattr(self, "maths_tree") else None).pack(side="left")
         ttk.Button(nav, text="↓", command=lambda: self.maths_tree.yview_scroll(3, "units") if hasattr(self, "maths_tree") else None).pack(side="left")
-
         cols = ("Function", "Formula", "Live Example", "Extra Formula", "Notes")
         style = ttk.Style()
         style.configure("Treeview", rowheight=110)
@@ -1256,9 +1675,7 @@ class BTCBlockPredictorGUI(tk.Tk):
             self.maths_tree.heading(col, text=col)
             self.maths_tree.column(col, width=220 if col != "Notes" else 340, anchor="w", stretch=True, minwidth=200)
         self.maths_tree.pack(side="top", fill="both", expand=True, padx=10, pady=5)
-
         self.maths_tree.configure(yscrollcommand=self.set_maths_scroll)
-
         data = [
             ("Average Block Time", "avg_sec = (last_ts - first_ts) / (last_h - first_h)", f"avg_sec = {600} sec", "", "Used for all predictions"),
             ("Estimated Timestamp", "est_ts = last_ts + (target - current) * avg_sec", "est_ts = 1745000000", "", "Future block time"),
@@ -1273,7 +1690,6 @@ class BTCBlockPredictorGUI(tk.Tk):
             ("Potential Winning Nonce", "PWN = Est Nonce + 1337", "PWN: 1234569227", "", "Lucky offset"),
             ("Predict Block", "est_ts = last_ts + (target - current) * avg_sec", "est_ts = 1745000000", "", "Full prediction using average block time"),
         ]
-
         for row in data:
             wrapped_row = list(row)
             wrapped_row[1] = self.advanced_math_wrap(wrapped_row[1], width=45)
@@ -1290,7 +1706,6 @@ class BTCBlockPredictorGUI(tk.Tk):
         self.notebook_win.minsize(900, 650)
         width = self.winfo_width()
         self.notebook_win.geometry(f"{width}x780")
-
         nav = ttk.Frame(self.notebook_win)
         nav.pack(side="bottom", fill="x", padx=10, pady=5)
         self.page_label = ttk.Label(nav, text="Page 1 / ?")
@@ -1301,7 +1716,6 @@ class BTCBlockPredictorGUI(tk.Tk):
         self.hsb_notebook.pack(side="left", fill="x", expand=True, padx=10)
         ttk.Button(nav, text="↑", command=lambda: self.tree.yview_scroll(-3, "units") if hasattr(self, "tree") else None).pack(side="left")
         ttk.Button(nav, text="↓", command=lambda: self.tree.yview_scroll(3, "units") if hasattr(self, "tree") else None).pack(side="left")
-
         top = ttk.Frame(self.notebook_win)
         top.pack(fill="x", padx=10, pady=8)
         ttk.Label(top, text="Search:").pack(side="left")
@@ -1317,7 +1731,6 @@ class BTCBlockPredictorGUI(tk.Tk):
         self.filter_max.pack(side="left", padx=5)
         ttk.Button(top, text="Apply", command=self.refresh_notebook_view).pack(side="left", padx=5)
         ttk.Button(top, text="Clear", command=self.clear_notebook_filters).pack(side="left")
-
         cols = ("Height", "Epoch Time", "Lead 0s", "Hash", "Size", "Tx", "Nonce", "Difficulty", "Hashrate (EH/s)", "Price (USD)")
         style = ttk.Style()
         style.configure("Treeview", rowheight=60)
@@ -1326,9 +1739,7 @@ class BTCBlockPredictorGUI(tk.Tk):
             self.tree.heading(col, text=col)
             self.tree.column(col, width=110, anchor="center", stretch=True)
         self.tree.pack(side="top", fill="both", expand=True, padx=10, pady=5)
-
         self.tree.configure(yscrollcommand=self.set_notebook_scroll)
-
         self.page_size = 50
         self.current_page = 0
         self.refresh_notebook_view()
@@ -1342,7 +1753,6 @@ class BTCBlockPredictorGUI(tk.Tk):
         self.predicts_win.minsize(900, 650)
         width = self.winfo_width()
         self.predicts_win.geometry(f"{width}x780")
-
         nav = ttk.Frame(self.predicts_win)
         nav.pack(side="bottom", fill="x", padx=10, pady=5)
         self.predict_page_label = ttk.Label(nav, text="Page 1 / ?")
@@ -1353,7 +1763,6 @@ class BTCBlockPredictorGUI(tk.Tk):
         self.hsb_predicts.pack(side="left", fill="x", expand=True, padx=10)
         ttk.Button(nav, text="↑", command=lambda: self.predict_tree.yview_scroll(-3, "units") if hasattr(self, "predict_tree") else None).pack(side="left")
         ttk.Button(nav, text="↓", command=lambda: self.predict_tree.yview_scroll(3, "units") if hasattr(self, "predict_tree") else None).pack(side="left")
-
         top = ttk.Frame(self.predicts_win)
         top.pack(fill="x", padx=10, pady=8)
         ttk.Label(top, text="Search:").pack(side="left")
@@ -1362,7 +1771,6 @@ class BTCBlockPredictorGUI(tk.Tk):
         search_entry.pack(side="left", padx=5)
         search_entry.bind("<KeyRelease>", lambda e: self.refresh_predicts_view())
         ttk.Button(top, text="Clear", command=self.clear_predicts_filters).pack(side="left", padx=5)
-
         cols = ("Target Block", "Predicted Time", "Delta Days", "Est Hashrate", "Est Price", "Est Tx", "Timestamp")
         style = ttk.Style()
         style.configure("Treeview", rowheight=60)
@@ -1371,9 +1779,7 @@ class BTCBlockPredictorGUI(tk.Tk):
             self.predict_tree.heading(col, text=col)
             self.predict_tree.column(col, width=140, anchor="center", stretch=True)
         self.predict_tree.pack(side="top", fill="both", expand=True, padx=10, pady=5)
-
         self.predict_tree.configure(yscrollcommand=self.set_predicts_scroll)
-
         self.predict_page_size = 50
         self.predict_current_page = 0
         self.refresh_predicts_view()
@@ -1387,7 +1793,6 @@ class BTCBlockPredictorGUI(tk.Tk):
         self.livep_win.minsize(900, 650)
         width = self.winfo_width()
         self.livep_win.geometry(f"{width}x780")
-
         nav = ttk.Frame(self.livep_win)
         nav.pack(side="bottom", fill="x", padx=10, pady=5)
         self.livep_page_label = ttk.Label(nav, text="Page 1 / ?")
@@ -1398,7 +1803,6 @@ class BTCBlockPredictorGUI(tk.Tk):
         self.hsb_livep.pack(side="left", fill="x", expand=True, padx=10)
         ttk.Button(nav, text="↑", command=lambda: self.livep_tree.yview_scroll(-3, "units") if hasattr(self, "livep_tree") else None).pack(side="left")
         ttk.Button(nav, text="↓", command=lambda: self.livep_tree.yview_scroll(3, "units") if hasattr(self, "livep_tree") else None).pack(side="left")
-
         top = ttk.Frame(self.livep_win)
         top.pack(fill="x", padx=10, pady=8)
         ttk.Label(top, text="Search:").pack(side="left")
@@ -1407,7 +1811,6 @@ class BTCBlockPredictorGUI(tk.Tk):
         search_entry.pack(side="left", padx=5)
         search_entry.bind("<KeyRelease>", lambda e: self.refresh_livep_view())
         ttk.Button(top, text="Clear", command=self.clear_livep_filters).pack(side="left", padx=5)
-
         cols = ("Epoch Time", "Next Diff Adj", "Est Hashrate", "Est Price", "Est Tx", "Est Nonce", "PWN")
         style = ttk.Style()
         style.configure("Treeview", rowheight=60)
@@ -1416,9 +1819,7 @@ class BTCBlockPredictorGUI(tk.Tk):
             self.livep_tree.heading(col, text=col)
             self.livep_tree.column(col, width=140, anchor="center", stretch=True)
         self.livep_tree.pack(side="top", fill="both", expand=True, padx=10, pady=5)
-
         self.livep_tree.configure(yscrollcommand=self.set_livep_scroll)
-
         self.livep_page_size = 50
         self.livep_current_page = 0
         self.refresh_livep_view()
@@ -1508,50 +1909,6 @@ class BTCBlockPredictorGUI(tk.Tk):
         self.queue_update(f"✅ Curve saved to {BR_CURVE_FILE} + archived to {BRC_ARCH_FILE}")
         self.queue_update(f"📊 Recent average: {curve_data[-1]['delta_days'] if curve_data else 0:.2f} days drift")
 
-    def predict_block(self):
-        if len(self.cache) < 3:
-            messagebox.showwarning("Too few blocks", "Need at least 3 blocks!")
-            return
-        try:
-            target = int(self.predict_entry.get().strip())
-        except:
-            messagebox.showerror("Error", "Valid block number")
-            return
-        with self.cache_lock:
-            current = max(int(h) for h in self.cache.keys())
-        if target <= current:
-            with self.cache_lock:
-                block = self.cache[str(target)]
-            dt = datetime.fromtimestamp(block["time"])
-            msg = f"✅ Block {target:,} mined: {dt.strftime('%Y-%m-%d %H:%M:%S UTC')}"
-            self.log_area.insert(tk.END, msg + "\n")
-            self.log_area.see(tk.END)
-            return
-        with self.cache_lock:
-            all_heights = sorted(int(h) for h in self.cache.keys())
-            use = all_heights[-2016:] if len(all_heights) > 2016 else all_heights
-            t_start = self.cache[str(use[0])]["time"]
-            t_end = self.cache[str(use[-1])]["time"]
-            avg_sec = (t_end - t_start) / (use[-1] - use[0]) if len(use) > 1 else 600
-            last_ts = self.cache[str(current)]["time"]
-        est_ts = last_ts + int((target - current) * avg_sec)
-        delta_days = (est_ts - (GENESIS_TIMESTAMP + target * 600)) / 86400.0
-        est_dt = datetime.fromtimestamp(est_ts)
-        msg = f"🚀 Prediction {target:,} → {est_dt.strftime('%Y-%m-%d %H:%M:%S UTC')} (Δ {delta_days:+.2f} days)"
-        self.log_area.insert(tk.END, msg + "\n")
-        self.log_area.see(tk.END)
-        entry = {
-            "target": target,
-            "est_time_str": est_dt.strftime('%Y-%m-%d %H:%M:%S UTC'),
-            "delta_days": round(delta_days, 2),
-            "est_hr": round(sum(b.get("estimated_hashrate", 0) for b in self.cache.values() if "estimated_hashrate" in b) / len(self.cache), 4),
-            "est_price": round(sum(b.get("price_usd", 0) for b in self.cache.values() if "price_usd" in b) / len(self.cache), 2),
-            "est_tx": int(sum(b.get("tx_count", 0) for b in self.cache.values() if "tx_count" in b) / len(self.cache) * 1.015),
-            "timestamp_str": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        }
-        self.predicts.append(entry)
-        self.save_predicts()
-
     def show_recent_rate(self):
         if len(self.cache) < 3:
             self.queue_update("⚠️ Need at least 3 blocks!")
@@ -1640,6 +1997,10 @@ class BTCBlockPredictorGUI(tk.Tk):
             for h in range(cached_max + 1, tip + 1):
                 self.get_full_block(h)
             self.queue_update("✅ New blocks added")
+            current_max = max((int(h) for h in self.cache.keys()), default=0)
+            if current_max >= tip and current_max > self.last_tip_level_height:
+                self.last_tip_level_height = current_max
+                self._trigger_live_prediction_update("periodic_tip_level")
         self.update_chain_progress()
 
     def periodic_notebook_refresh(self):
@@ -1737,36 +2098,8 @@ class BTCBlockPredictorGUI(tk.Tk):
     def test_rpc_connection(self):
         self.queue_update("🔄 Testing RPC connection (placeholder - configure your node credentials)...")
 
-    def open_log_settings(self):
-        win = tk.Toplevel(self)
-        win.title("⚙️ L&R Settings")
-        win.geometry("620x520")
-        ttk.Label(win, text="Log & Results Settings", font=("Helvetica", 12, "bold")).pack(pady=10)
-        frame = ttk.Frame(win)
-        frame.pack(fill="both", expand=True, padx=20, pady=10)
-        for key, default in self.log_settings.items():
-            var = tk.BooleanVar(value=default)
-            cb = ttk.Checkbutton(frame, text=key.replace("_", " ").title(), variable=var)
-            cb.pack(anchor="center")
-            setattr(self, f"log_var_{key}", var)
-        ttk.Button(win, text="Save", command=lambda: self.save_log_settings(win)).pack(pady=10)
-
-    def save_log_settings(self, win):
-        for key in self.log_settings:
-            self.log_settings[key] = getattr(self, f"log_var_{key}").get()
-        if self.log_settings["debug_data"] and not self.log_settings["export_logs"]:
-            self.log_settings["export_logs"] = True
-            self.queue_update("🔄 Auto-enabled Export Logs because Debug Data is on")
-        if not self.log_settings["export_logs"] and self.log_settings["debug_data"]:
-            self.log_settings["debug_data"] = False
-            self.queue_update("🔄 Auto-disabled Debug Data because Export Logs was turned off")
-        self.save_all_settings()
-        win.destroy()
-        self.queue_update("✅ Log & Results settings saved")
-
     def create_widgets(self):
         ttk.Label(self, text="🟠 BTC Block Time Predictor", font=("Helvetica", 18, "bold")).pack(pady=10)
-
         sf = ttk.LabelFrame(self, text="Live Status", padding=10)
         sf.pack(fill="x", padx=15, pady=5)
         self.status_cached = ttk.Label(sf, text="Cached Blocks: 0", anchor="center")
@@ -1783,12 +2116,10 @@ class BTCBlockPredictorGUI(tk.Tk):
         self.last_drift.grid(row=2, column=1, sticky="ew", padx=10)
         sf.columnconfigure(0, weight=1)
         sf.columnconfigure(1, weight=1)
-
         pf = ttk.LabelFrame(self, text="Live Fetch Progress", padding=8)
         pf.pack(fill="x", padx=15, pady=4)
         self.live_progress = ttk.Label(pf, text="→ Ready", foreground="#0066cc", font=("Consolas", 11), anchor="center")
         self.live_progress.pack(fill="x")
-
         chain_frame = ttk.LabelFrame(self, text="Chain Coverage", padding=8)
         chain_frame.pack(fill="x", padx=15, pady=4)
         self.chain_progress_var = tk.DoubleVar(value=0.0)
@@ -1799,7 +2130,6 @@ class BTCBlockPredictorGUI(tk.Tk):
         ttk.Label(chain_labels, text="Block 0 (Genesis)", foreground="#666666").pack(side="left")
         self.chain_tip_label = ttk.Label(chain_labels, text="Tip: — | Cached: —", foreground="#0066cc")
         self.chain_tip_label.pack(side="right")
-
         cf = ttk.LabelFrame(self, text="Actions", padding=12)
         cf.pack(fill="x", padx=15, pady=8)
         self.btn_quick = ttk.Button(cf, text="🔥 Quick Sync Recent", command=lambda: self._start_sync("quick"))
@@ -1820,7 +2150,6 @@ class BTCBlockPredictorGUI(tk.Tk):
         ttk.Button(cf, text="⚙️ L&R", command=self.open_log_settings).grid(row=2, column=3, padx=6, pady=4, sticky="ew")
         for i in range(4):
             cf.columnconfigure(i, weight=1)
-
         pred_live_frame = ttk.LabelFrame(self, text="Live Predictions", padding=12)
         pred_live_frame.pack(fill="x", padx=15, pady=8)
         self.lbl_diff = ttk.Label(pred_live_frame, text="Next Diff Adj: —", anchor="w")
@@ -1837,9 +2166,10 @@ class BTCBlockPredictorGUI(tk.Tk):
         self.lbl_nonce.grid(row=1, column=1, padx=12, pady=4, sticky="w")
         self.lbl_win_nonce = ttk.Label(pred_live_frame, text="Potential Winning Nonce: —", anchor="w")
         self.lbl_win_nonce.grid(row=1, column=2, padx=12, pady=4, sticky="w", columnspan=2)
+        self.btn_livep_settings = ttk.Button(pred_live_frame, text="⚙️", width=3, command=self.open_live_predictions_settings)
+        self.btn_livep_settings.grid(row=1, column=3, padx=5, pady=4, sticky="e")
         for i in range(4):
             pred_live_frame.columnconfigure(i, weight=1)
-
         tip_frame = ttk.LabelFrame(self, text="Tip Data", padding=12)
         tip_frame.pack(fill="x", padx=15, pady=8)
         self.tip_block_num = ttk.Label(tip_frame, text="Block Number: —", anchor="w")
@@ -1862,7 +2192,6 @@ class BTCBlockPredictorGUI(tk.Tk):
         self.tip_hash.grid(row=2, column=0, columnspan=4, padx=12, pady=4, sticky="w")
         for i in range(4):
             tip_frame.columnconfigure(i, weight=1)
-
         pred_input_frame = ttk.LabelFrame(self, text="Predict Block", padding=10)
         pred_input_frame.pack(fill="x", padx=15, pady=8)
         inner = ttk.Frame(pred_input_frame)
@@ -1873,7 +2202,6 @@ class BTCBlockPredictorGUI(tk.Tk):
         self.predict_entry.insert(0, "1000000")
         ttk.Button(inner, text="🚀 Predict", command=self.predict_block).pack(side="left", padx=6)
         ttk.Button(inner, text="📓 Notebook", command=self.open_predicts_notebook).pack(side="left", padx=6)
-
         sync_frame = ttk.LabelFrame(self, text="Sync Progress", padding=8)
         sync_frame.pack(fill="x", padx=15, pady=4)
         self.sync_progress_var = tk.DoubleVar(value=0.0)
@@ -1881,15 +2209,12 @@ class BTCBlockPredictorGUI(tk.Tk):
         self.sync_progress.pack(fill="x", padx=5, pady=2)
         self.sync_progress_label = ttk.Label(sync_frame, text="✅ Idle – Ready for next operation", font=("Consolas", 9))
         self.sync_progress_label.pack(anchor="center")
-
         lf = ttk.LabelFrame(self, text="Log & Results", padding=8)
         lf.pack(fill="both", expand=True, padx=15, pady=8)
         self.log_area = scrolledtext.ScrolledText(lf, height=14, font=("Consolas", 10))
         self.log_area.pack(fill="both", expand=True)
-
         footer_text = f"Persistent file: {CACHE_FILE} | Chain file: {BTC_CHAIN_FILE} | Predicts: {PREDICTS_FILE} | LiveP: {LIVEP_FILE}"
         ttk.Label(self, text=footer_text, font=("Helvetica", 9), foreground="gray", anchor="center").pack(side="bottom", fill="x", pady=5)
-
         self.update_idletasks()
 
 if __name__ == "__main__":
